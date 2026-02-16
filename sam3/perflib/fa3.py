@@ -11,7 +11,12 @@ def flash_attn_func_op(
 ) -> torch.Tensor:
     from flash_attn_interface import flash_attn_func as fa3
 
-    return fa3(q, k, v)
+    out = fa3(q, k, v)
+    # flash-attn versions differ: some return just output, others return
+    # (output, softmax_lse). Keep the custom op contract as a single Tensor.
+    if isinstance(out, tuple):
+        return out[0]
+    return out
 
 
 def flash_attn_func(q, k, v):

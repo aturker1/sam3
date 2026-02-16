@@ -543,7 +543,13 @@ class Sam3TrackerBase(torch.nn.Module):
             ):
                 continue
 
-            score_per_frame = output_dict["non_cond_frame_outputs"][i]["eff_iou_score"]
+            frame_out = output_dict["non_cond_frame_outputs"][i]
+            # Prefer a pre-cached host scalar to avoid repeated GPU->CPU sync in comparisons.
+            score_per_frame = frame_out.get("eff_iou_score_value", None)
+            if score_per_frame is None:
+                score_per_frame = frame_out["eff_iou_score"]
+                if torch.is_tensor(score_per_frame):
+                    score_per_frame = float(score_per_frame.detach().cpu().item())
 
             if score_per_frame > self.mf_threshold:  # threshold
                 valid_indices.insert(0, i)
@@ -1015,6 +1021,10 @@ class Sam3TrackerBase(torch.nn.Module):
             current_out["eff_iou_score"] = self.cal_mem_score(
                 object_score_logits, iou_score
             )
+            # Cache once as host scalar for repeated filtering/comparison logic.
+            current_out["eff_iou_score_value"] = float(
+                current_out["eff_iou_score"].detach().cpu().item()
+            )
         if not self.training:
             # Only add this in inference (to avoid unused param in activation checkpointing;
             # it's mainly used in the demo to encode spatial memories w/ consolidated masks)
@@ -1059,6 +1069,7 @@ class Sam3TrackerBase(torch.nn.Module):
             if self.use_memory_selection:
                 trimmed_out["iou_score"] = current_out["iou_score"].cpu()
                 trimmed_out["eff_iou_score"] = current_out["eff_iou_score"].cpu()
+                trimmed_out["eff_iou_score_value"] = current_out["eff_iou_score_value"]
             current_out = trimmed_out
 
         # Optionally, trim the output of past non-conditioning frame (r * num_maskmem frames
@@ -1079,10 +1090,15 @@ class Sam3TrackerBase(torch.nn.Module):
             past_out = output_dict["non_cond_frame_outputs"].get(past_frame_idx, None)
 
             if past_out is not None:
-                print(past_out.get("eff_iou_score", 0))
+                eff_iou_score_value = past_out.get(
+                    "eff_iou_score_value", past_out.get("eff_iou_score", 0)
+                )
+                if torch.is_tensor(eff_iou_score_value):
+                    eff_iou_score_value = float(eff_iou_score_value.detach().cpu().item())
+                print(eff_iou_score_value)
                 if (
                     self.use_memory_selection
-                    and past_out.get("eff_iou_score", 0) < self.mf_threshold
+                    and eff_iou_score_value < self.mf_threshold
                 ) or not self.use_memory_selection:
                     output_dict["non_cond_frame_outputs"][past_frame_idx] = (
                         _trim_past_out(past_out, current_out)

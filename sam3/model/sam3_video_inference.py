@@ -412,9 +412,11 @@ class Sam3VideoInference(Sam3VideoBase):
         # removed_obj_ids is only needed on rank 0 to handle hotstart delay buffer
         if self.rank == 0:
             rank0_metadata = tracker_metadata_new["rank0_metadata"]
-            removed_obj_ids = rank0_metadata["removed_obj_ids"]
+            removed_obj_ids = set(rank0_metadata["removed_obj_ids"])
             out["removed_obj_ids"] = removed_obj_ids
-            out["suppressed_obj_ids"] = rank0_metadata["suppressed_obj_ids"][frame_idx]
+            out["suppressed_obj_ids"] = set(
+                rank0_metadata["suppressed_obj_ids"][frame_idx]
+            )
             out["frame_stats"] = frame_stats
             if self.masklet_confirmation_enable:
                 status = rank0_metadata["masklet_confirmation"]["status"]

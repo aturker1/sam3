@@ -7,7 +7,6 @@ import logging
 import math
 import os
 from collections import defaultdict
-from copy import deepcopy
 from enum import Enum
 from typing import Any, Dict, List, Set
 
@@ -515,17 +514,23 @@ class Sam3VideoBase(nn.Module):
         tracker_states_local: List[Any],
         is_image_only: bool = False,
     ):
+        tracker_score_history_prev = tracker_metadata_prev[
+            "obj_id_to_tracker_score_frame_wise"
+        ]
+        tracker_score_history_new = defaultdict(dict, tracker_score_history_prev)
+        # Copy-on-write for current frame: only clone the bucket we are about to mutate.
+        tracker_score_history_new[frame_idx] = dict(
+            tracker_score_history_prev.get(frame_idx, {})
+        )
         # initialize new metadata from previous metadata (its values will be updated later)
         tracker_metadata_new = {
-            "obj_ids_per_gpu": deepcopy(tracker_metadata_prev["obj_ids_per_gpu"]),
+            "obj_ids_per_gpu": list(tracker_metadata_prev["obj_ids_per_gpu"]),
             "obj_ids_all_gpu": None,  # will be filled later
-            "num_obj_per_gpu": deepcopy(tracker_metadata_prev["num_obj_per_gpu"]),
-            "obj_id_to_score": deepcopy(tracker_metadata_prev["obj_id_to_score"]),
-            "obj_id_to_tracker_score_frame_wise": deepcopy(
-                tracker_metadata_prev["obj_id_to_tracker_score_frame_wise"]
-            ),
+            "num_obj_per_gpu": tracker_metadata_prev["num_obj_per_gpu"].copy(),
+            "obj_id_to_score": dict(tracker_metadata_prev["obj_id_to_score"]),
+            "obj_id_to_tracker_score_frame_wise": tracker_score_history_new,
             "obj_id_to_last_occluded": {},  # will be filled later
-            "max_obj_id": deepcopy(tracker_metadata_prev["max_obj_id"]),
+            "max_obj_id": tracker_metadata_prev["max_obj_id"],
         }
 
         # Initialize reconditioned_obj_ids early to avoid UnboundLocalError
@@ -583,8 +588,13 @@ class Sam3VideoBase(nn.Module):
             # b) handle hotstart heuristics to remove objects
             # here `rank0_metadata` contains metadata stored on (and only accessible to) GPU 0;
             # we avoid broadcasting them to other GPUs to save communication cost, assuming
-            # that `rank0_metadata` is not needed by other GPUs
-            rank0_metadata_new = deepcopy(tracker_metadata_prev["rank0_metadata"])
+            # that `rank0_metadata` is not needed by other GPUs.
+            #
+            # IMPORTANT: avoid a full `deepcopy` per frame. This structure can grow with video
+            # length and become a major Python-side bottleneck that stalls GPU work.
+            # We mutate rank0 metadata in-place because the previous frame's rank0 metadata is
+            # not consumed after this planning step.
+            rank0_metadata_new = tracker_metadata_prev["rank0_metadata"]
             if not hasattr(self, "_warm_up_complete") or self._warm_up_complete:
                 obj_ids_newly_removed, rank0_metadata_new = self._process_hotstart(
                     frame_idx=frame_idx,

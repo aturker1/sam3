@@ -96,16 +96,16 @@ def apply_rotary_enc_real(
     freqs_cis_imag: torch.Tensor,
     repeat_freqs_k: bool = False,
 ):
-    assert xk is not None
-    assert xk.shape[-2] != 0
-
     xq_real = xq.float().reshape(*xq.shape[:-1], -1, 2)[..., 0]
     xq_imag = xq.float().reshape(*xq.shape[:-1], -1, 2)[..., 1]
-    xk_real = xk.float().reshape(*xk.shape[:-1], -1, 2)[..., 0]
-    xk_imag = xk.float().reshape(*xk.shape[:-1], -1, 2)[..., 1]
     freqs_cis_real = reshape_for_broadcast(freqs_cis_real, xq_real)
     freqs_cis_imag = reshape_for_broadcast(freqs_cis_imag, xq_imag)
     xq_out = complex_mult(xq_real, xq_imag, freqs_cis_real, freqs_cis_imag).flatten(3)
+    if xk is None or xk.shape[-2] == 0:
+        # Keep parity with apply_rotary_enc: rotate q and return empty/unset k unchanged.
+        return xq_out.type_as(xq).to(xq.device), xk
+    xk_real = xk.float().reshape(*xk.shape[:-1], -1, 2)[..., 0]
+    xk_imag = xk.float().reshape(*xk.shape[:-1], -1, 2)[..., 1]
     if repeat_freqs_k:
         r = xk_real.shape[-2] // xq_real.shape[-2]
         freqs_cis_real = freqs_cis_real.repeat(*([1] * (freqs_cis_real.ndim - 2)), r, 1)

@@ -191,14 +191,31 @@ class Sam3Image(torch.nn.Module):
             img_sizes=vis_feat_sizes,
             img_pos_embeds=img_pos_embeds,
         )
+        geo_feats = geo_feats.to(torch.bfloat16)
+        # Keep prompt components in a consistent dtype/device to avoid hidden to_copy kernels
+        # during prompt concatenation in the hot path.
+        # txt_feats = txt_feats.to(
+        #     device=geo_feats.device, dtype=geo_feats.dtype, non_blocking=True
+        # )
+        # txt_masks = txt_masks.to(device=geo_masks.device, non_blocking=True)
+
         if visual_prompt_embed is None:
             visual_prompt_embed = torch.zeros(
-                (0, *geo_feats.shape[1:]), device=geo_feats.device
+                (0, *geo_feats.shape[1:]),
+                device=geo_feats.device,
+                dtype=geo_feats.dtype,
             )
             visual_prompt_mask = torch.zeros(
                 (*geo_masks.shape[:-1], 0),
                 device=geo_masks.device,
                 dtype=geo_masks.dtype,
+            )
+        else:
+            visual_prompt_embed = visual_prompt_embed.to(
+                device=geo_feats.device, dtype=geo_feats.dtype, non_blocking=True
+            )
+            visual_prompt_mask = visual_prompt_mask.to(
+                device=geo_masks.device, dtype=geo_masks.dtype, non_blocking=True
             )
         if encode_text:
             prompt = torch.cat([txt_feats, geo_feats, visual_prompt_embed], dim=0)
@@ -206,7 +223,7 @@ class Sam3Image(torch.nn.Module):
         else:
             prompt = torch.cat([geo_feats, visual_prompt_embed], dim=0)
             prompt_mask = torch.cat([geo_masks, visual_prompt_mask], dim=1)
-        return prompt, prompt_mask, backbone_out
+        return prompt, prompt_mask, backbone_out, feat_tuple
 
     def _run_encoder(
         self,
@@ -214,10 +231,24 @@ class Sam3Image(torch.nn.Module):
         find_input,
         prompt,
         prompt_mask,
+        feat_tuple=None,
         encoder_extra_kwargs: Optional[Dict] = None,
     ):
-        feat_tuple = self._get_img_feats(backbone_out, find_input.img_ids)
+        if feat_tuple is None:
+            feat_tuple = self._get_img_feats(backbone_out, find_input.img_ids)
         backbone_out, img_feats, img_pos_embeds, vis_feat_sizes = feat_tuple
+
+        # Keep encoder inputs in the same dtype as prompt to avoid fp32 fallback GEMMs
+        # when upstream features arrive in float32.
+        target_dtype = prompt.dtype
+        img_feats = [
+            x.to(device=prompt.device, dtype=target_dtype, non_blocking=True)
+            for x in img_feats
+        ]
+        img_pos_embeds = [
+            x.to(device=prompt.device, dtype=target_dtype, non_blocking=True)
+            for x in img_pos_embeds
+        ]
 
         # Run the encoder
         prompt_pos_embed = torch.zeros_like(prompt)
@@ -444,13 +475,13 @@ class Sam3Image(torch.nn.Module):
         geometric_prompt: Prompt,
     ):
         with torch.profiler.record_function("SAM3Image._encode_prompt"):
-            prompt, prompt_mask, backbone_out = self._encode_prompt(
+            prompt, prompt_mask, backbone_out, feat_tuple = self._encode_prompt(
                 backbone_out, find_input, geometric_prompt
             )
         # Run the encoder
         with torch.profiler.record_function("SAM3Image._run_encoder"):
             backbone_out, encoder_out, _ = self._run_encoder(
-                backbone_out, find_input, prompt, prompt_mask
+                backbone_out, find_input, prompt, prompt_mask, feat_tuple=feat_tuple
             )
         out = {
             "encoder_hidden_states": encoder_out["encoder_hidden_states"],
@@ -695,6 +726,26 @@ class Sam3ImageOnVideoMultiGPU(Sam3Image):
             gather_backbone_out = isinstance(self.backbone, SAM3VLBackbone)
         self.gather_backbone_out = gather_backbone_out
 
+    def _apply_mask_nms_inplace(
+        self,
+        out_local,
+        nms_prob_thresh: float,
+        nms_iou_thresh: float,
+    ) -> None:
+        pred_probs = out_local["pred_logits"].squeeze(-1).sigmoid()
+        pred_masks = out_local["pred_masks"]
+        keep_all = pred_probs > nms_prob_thresh
+        valid_counts = keep_all.sum(dim=1)
+        prompt_inds = torch.nonzero(valid_counts > 1, as_tuple=False).squeeze(1)
+        for prompt_idx in prompt_inds.tolist():
+            keep_all[prompt_idx] = nms_masks(
+                pred_probs=pred_probs[prompt_idx],
+                pred_masks=pred_masks[prompt_idx],
+                prob_threshold=nms_prob_thresh,
+                iou_threshold=nms_iou_thresh,
+            )
+        out_local["pred_logits"][:, :, 0].sub_(1e4 * (~keep_all).float())
+
     def forward_video_grounding_multigpu(
         self,
         backbone_out,
@@ -717,6 +768,43 @@ class Sam3ImageOnVideoMultiGPU(Sam3Image):
         Compute the detector's detection outputs in a distributed manner, where all GPUs process
         a chunk of frames (equal to the number of GPUs) at once and store them in cache.
         """
+        # Single-GPU fast path: skip multi-GPU chunk/buffer orchestration and any
+        # async collective plumbing entirely.
+        if self.world_size == 1:
+            with torch.profiler.record_function("forward_grounding_single_gpu"):
+                out_local = self.forward_grounding(
+                    backbone_out=backbone_out,
+                    find_input=find_inputs[frame_idx],
+                    find_target=None,
+                    geometric_prompt=geometric_prompt,
+                )
+
+            if run_nms:
+                with torch.profiler.record_function("nms_masks_single_gpu"):
+                    assert nms_prob_thresh is not None and nms_iou_thresh is not None
+                    self._apply_mask_nms_inplace(
+                        out_local=out_local,
+                        nms_prob_thresh=nms_prob_thresh,
+                        nms_iou_thresh=nms_iou_thresh,
+                    )
+
+            out = {
+                "pred_logits": out_local["pred_logits"],
+                "pred_boxes": out_local["pred_boxes"],
+                "pred_boxes_xyxy": out_local["pred_boxes_xyxy"],
+                "pred_masks": out_local["pred_masks"],
+            }
+
+            if self.gather_backbone_out:
+                feats = out_local["prev_encoder_out"]["backbone_out"]["sam2_backbone_out"]
+                assert len(feats["backbone_fpn"]) == 3
+                out["tracker_backbone_fpn_0"] = feats["backbone_fpn"][0]
+                out["tracker_backbone_fpn_1"] = feats["backbone_fpn"][1]
+                out["tracker_backbone_fpn_2"] = feats["backbone_fpn"][2]
+                out["tracker_backbone_pos_enc"] = feats["vision_pos_enc"]
+
+            return out, backbone_out
+
         # Step 1: fetch the detector outputs in the current chunk from buffer
         frame_idx_curr_b = frame_idx - frame_idx % self.world_size
         frame_idx_curr_e = min(frame_idx_curr_b + self.world_size, num_frames)
@@ -814,30 +902,29 @@ class Sam3ImageOnVideoMultiGPU(Sam3Image):
             with torch.profiler.record_function("nms_masks"):
                 # run NMS as a post-processing step on top of the detection outputs
                 assert nms_prob_thresh is not None and nms_iou_thresh is not None
-                pred_probs = out_local["pred_logits"].squeeze(-1).sigmoid()
-                pred_masks = out_local["pred_masks"]
-                # loop over text prompts (not an overhead for demo where there's only 1 prompt)
-                for prompt_idx in range(pred_probs.size(0)):
-                    keep = nms_masks(
-                        pred_probs=pred_probs[prompt_idx],
-                        pred_masks=pred_masks[prompt_idx],
-                        prob_threshold=nms_prob_thresh,
-                        iou_threshold=nms_iou_thresh,
-                    )
-                    # set a very low threshold for those detections removed by NMS
-                    out_local["pred_logits"][prompt_idx, :, 0] -= 1e4 * (~keep).float()
+                self._apply_mask_nms_inplace(
+                    out_local=out_local,
+                    nms_prob_thresh=nms_prob_thresh,
+                    nms_iou_thresh=nms_iou_thresh,
+                )
 
         if self.gather_backbone_out:
-            # gather the SAM 2 backbone features across GPUs
+            # gather the SAM 2 backbone features across GPUs.
+            # On single-GPU, keep features local to avoid unnecessary dtype casts/copies.
             feats = out_local["prev_encoder_out"]["backbone_out"]["sam2_backbone_out"]
             assert len(feats["backbone_fpn"]) == 3  # SAM2 backbone always have 3 levels
-            # cast the SAM2 backbone features to bfloat16 for all-gather (this is usually
-            # a no-op, SAM2 backbone features are likely already in bfloat16 due to AMP)
-            backbone_fpn_bf16 = [x.to(torch.bfloat16) for x in feats["backbone_fpn"]]
-            fpn0, fpn_handle0 = self._gather_tensor(backbone_fpn_bf16[0])
-            fpn1, fpn_handle1 = self._gather_tensor(backbone_fpn_bf16[1])
-            fpn2, fpn_handle2 = self._gather_tensor(backbone_fpn_bf16[2])
-            # vision_pos_enc is the same on all frames, so no need to all-gather them
+            if self.world_size == 1:
+                fpn0, fpn_handle0 = feats["backbone_fpn"][0], None
+                fpn1, fpn_handle1 = feats["backbone_fpn"][1], None
+                fpn2, fpn_handle2 = feats["backbone_fpn"][2], None
+            else:
+                # cast the SAM2 backbone features to bfloat16 for all-gather (this is
+                # usually a no-op, SAM2 backbone features are likely already in bf16)
+                backbone_fpn_bf16 = [x.to(torch.bfloat16) for x in feats["backbone_fpn"]]
+                fpn0, fpn_handle0 = self._gather_tensor(backbone_fpn_bf16[0])
+                fpn1, fpn_handle1 = self._gather_tensor(backbone_fpn_bf16[1])
+                fpn2, fpn_handle2 = self._gather_tensor(backbone_fpn_bf16[2])
+            # vision_pos_enc is the same on all frames, so no need to all-gather it.
             vision_pos_enc = feats["vision_pos_enc"]
 
         # trim the detector output to only include the necessary keys
@@ -847,6 +934,16 @@ class Sam3ImageOnVideoMultiGPU(Sam3Image):
             "pred_boxes_xyxy": out_local["pred_boxes_xyxy"],
             "pred_masks": out_local["pred_masks"],
         }
+
+        if self.world_size == 1:
+            frame_buffer = {k: (v, None) for k, v in out_local.items()}
+            if self.gather_backbone_out:
+                frame_buffer["tracker_backbone_fpn_0"] = (fpn0, fpn_handle0)
+                frame_buffer["tracker_backbone_fpn_1"] = (fpn1, fpn_handle1)
+                frame_buffer["tracker_backbone_fpn_2"] = (fpn2, fpn_handle2)
+                frame_buffer["tracker_backbone_pos_enc"] = (vision_pos_enc, None)
+            multigpu_buffer[frame_idx_begin] = frame_buffer
+            return
 
         # gather the results: after this step, each GPU will receive detector outputs on
         # all frames in the chunk and store them in `multigpu_buffer`

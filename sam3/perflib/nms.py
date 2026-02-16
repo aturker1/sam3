@@ -3,9 +3,11 @@
 # pyre-unsafe
 
 import logging
+import os
 
 import numpy as np
 import torch
+from sam3.perflib.compile import compile_wrapper
 from sam3.perflib.masks_ops import mask_iou
 
 
@@ -19,6 +21,23 @@ except ImportError:
         'pip uninstall -y torch_generic_nms; TORCH_CUDA_ARCH_LIST="8.0 9.0" pip install git+https://github.com/ronghanghu/torch_generic_nms'
     )
     GENERIC_NMS_AVAILABLE = False
+    from sam3.perflib.triton.nms import nms_triton
+
+_COMPILE_MASK_NMS_IOU = os.getenv("SAM3_COMPILE_MASK_NMS_IOU", "0") == "1"
+if _COMPILE_MASK_NMS_IOU:
+    # Compile the dense mask-IoU kernel used by mask NMS.
+    # Keep this optional since compile has warmup overhead.
+    _mask_iou_for_nms = compile_wrapper(
+        mask_iou,
+        mode="reduce-overhead",
+        fullgraph=False,
+        dynamic=True,
+        name="compiled_mask_iou_for_nms",
+        make_contiguous=False,
+        clone_output=False,
+    )
+else:
+    _mask_iou_for_nms = mask_iou
 
 
 def nms_masks(
@@ -40,16 +59,18 @@ def nms_masks(
     # prefilter the detections with prob_threshold ("valid" are those above prob_threshold)
     is_valid = pred_probs > prob_threshold  # (num_det,)
     probs = pred_probs[is_valid]  # (num_valid,)
+    num_valid = probs.numel()
+    if num_valid <= 1:
+        # no overlap suppression is needed for 0/1 valid detections
+        return is_valid
     masks_binary = pred_masks[is_valid] > 0  # (num_valid, H_mask, W_mask)
-    if probs.numel() == 0:
-        return is_valid  # no valid detection, return empty keep mask
 
-    ious = mask_iou(masks_binary, masks_binary)  # (num_valid, num_valid)
+    ious = _mask_iou_for_nms(masks_binary, masks_binary)  # (num_valid, num_valid)
     kept_inds = generic_nms(ious, probs, iou_threshold)
 
-    # valid_inds are the indices among `probs` of valid detections before NMS (or -1 for invalid)
-    valid_inds = torch.where(is_valid, is_valid.cumsum(dim=0) - 1, -1)  # (num_det,)
-    keep = torch.isin(valid_inds, kept_inds)  # (num_det,)
+    keep = torch.zeros_like(is_valid)
+    valid_det_inds = torch.nonzero(is_valid, as_tuple=False).squeeze(1)
+    keep[valid_det_inds[kept_inds]] = True
     return keep
 
 
@@ -65,8 +86,6 @@ def generic_nms(
         if GENERIC_NMS_AVAILABLE:
             return generic_nms_cuda(ious, scores, iou_threshold, use_iou_matrix=True)
         else:
-            from sam3.perflib.triton.nms import nms_triton
-
             return nms_triton(ious, scores, iou_threshold)
 
     return generic_nms_cpu(ious, scores, iou_threshold)

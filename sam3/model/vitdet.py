@@ -30,6 +30,11 @@ from torch import Tensor
 
 from .model_misc import LayerScale
 
+try:
+    from sam3.perflib.fa3 import flash_attn_func
+except Exception:
+    flash_attn_func = None
+
 
 def init_t_xy(
     end_x: int, end_y: int, scale: float = 1.0, offset: int = 0
@@ -54,42 +59,48 @@ def compute_axial_cis(
     t_x, t_y = init_t_xy(end_x, end_y, scale_pos, offset)
     freqs_x = torch.outer(t_x, freqs_x)
     freqs_y = torch.outer(t_y, freqs_y)
-    freqs_cis_x = torch.polar(torch.ones_like(freqs_x), freqs_x)
-    freqs_cis_y = torch.polar(torch.ones_like(freqs_y), freqs_y)
-    return torch.cat([freqs_cis_x, freqs_cis_y], dim=-1)
+    freqs = torch.cat([freqs_x, freqs_y], dim=-1)
+    freqs_cos = freqs.cos().repeat_interleave(2, dim=-1).float()
+    freqs_sin = freqs.sin().repeat_interleave(2, dim=-1).float()
+    return freqs_cos, freqs_sin
 
 
-def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+def reshape_for_broadcast(freqs: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     ndim = x.ndim
     assert 0 <= 1 < ndim
-    assert freqs_cis.shape == (x.shape[-2], x.shape[-1])
+    assert freqs.shape == (x.shape[-2], x.shape[-1])
     shape = [d if i >= ndim - 2 else 1 for i, d in enumerate(x.shape)]
-    return freqs_cis.view(*shape)
+    return freqs.view(*shape)
+
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x_real, x_imag = x.reshape(*x.shape[:-1], -1, 2).unbind(-1)
+    return torch.stack((-x_imag, x_real), dim=-1).flatten(3)
 
 
 def apply_rotary_enc(
     xq: torch.Tensor,
     xk: torch.Tensor,
-    freqs_cis: torch.Tensor,
+    freqs_cis: Tuple[torch.Tensor, torch.Tensor],
     repeat_freqs_k: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    xk_ = (
-        torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-        if xk.shape[-2] != 0
-        else None
-    )
-    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-    if xk_ is None:
+    freqs_cos, freqs_sin = freqs_cis
+    freqs_cos = reshape_for_broadcast(freqs_cos, xq).to(xq.device)
+    freqs_sin = reshape_for_broadcast(freqs_sin, xq).to(xq.device)
+
+    xq_out = (xq.float() * freqs_cos + rotate_half(xq).float() * freqs_sin).type_as(xq)
+    if xk.shape[-2] == 0:
         # no keys to rotate, due to dropout
-        return xq_out.type_as(xq).to(xq.device), xk
+        return xq_out, xk
     # repeat freqs along seq_len dim to match k seq_len
     if repeat_freqs_k:
-        r = xk_.shape[-2] // xq_.shape[-2]
-        freqs_cis = freqs_cis.repeat(*([1] * (freqs_cis.ndim - 2)), r, 1)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
-    return xq_out.type_as(xq).to(xq.device), xk_out.type_as(xk).to(xk.device)
+        r = xk.shape[-2] // xq.shape[-2]
+        repeat_factors = [1] * freqs_cos.ndim
+        repeat_factors[-2] = r
+        freqs_cos = freqs_cos.repeat(*repeat_factors)
+        freqs_sin = freqs_sin.repeat(*repeat_factors)
+    xk_out = (xk.float() * freqs_cos + rotate_half(xk).float() * freqs_sin).type_as(xk)
+    return xq_out, xk_out
 
 
 def window_partition(x: Tensor, window_size: int) -> Tuple[Tensor, Tuple[int, int]]:
@@ -422,7 +433,8 @@ class Attention(nn.Module):
 
     def _setup_rope_freqs(self) -> None:
         if not self.use_rope:
-            self.freqs_cis = None
+            self.freqs_cos = None
+            self.freqs_sin = None
             return
 
         assert self.input_size is not None
@@ -442,28 +454,72 @@ class Attention(nn.Module):
         if self.rope_interp:
             scale_pos = self.rope_pt_size[0] / self.input_size[0]
         # get scaled freqs_cis
-        freqs_cis = self.compute_cis(
+        freqs_cos, freqs_sin = self.compute_cis(
             end_x=self.input_size[0],
             end_y=self.input_size[1],
             scale_pos=scale_pos,
         )
         if self.cls_token:
-            t = torch.zeros(
-                self.head_dim // 2,
-                dtype=torch.float32,
-                device=freqs_cis.device,
-            )
-            cls_freqs_cis = torch.polar(torch.ones_like(t), t)[None, :]
-            freqs_cis = torch.cat([cls_freqs_cis, freqs_cis], dim=0)
+            cls_freqs_cos = torch.ones(1, self.head_dim, dtype=torch.float32, device=freqs_cos.device)
+            cls_freqs_sin = torch.zeros(1, self.head_dim, dtype=torch.float32, device=freqs_sin.device)
+            freqs_cos = torch.cat([cls_freqs_cos, freqs_cos], dim=0)
+            freqs_sin = torch.cat([cls_freqs_sin, freqs_sin], dim=0)
 
-        self.register_buffer("freqs_cis", freqs_cis)
+        self.register_buffer("freqs_cos", freqs_cos)
+        self.register_buffer("freqs_sin", freqs_sin)
 
     def _apply_rope(self, q, k) -> Tuple[Tensor, Tensor]:
         if not self.use_rope:
             return q, k
 
-        assert self.freqs_cis is not None
-        return apply_rotary_enc(q, k, freqs_cis=self.freqs_cis)
+        assert self.freqs_cos is not None
+        assert self.freqs_sin is not None
+        return apply_rotary_enc(q, k, freqs_cis=(self.freqs_cos, self.freqs_sin))
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        # Backward compatibility: older checkpoints store a single complex RoPE buffer `freqs_cis`.
+        freqs_cis_key = prefix + "freqs_cis"
+        freqs_cos_key = prefix + "freqs_cos"
+        freqs_sin_key = prefix + "freqs_sin"
+        if (
+            self.use_rope
+            and freqs_cis_key in state_dict
+            and freqs_cos_key not in state_dict
+            and freqs_sin_key not in state_dict
+        ):
+            freqs_cis = state_dict.pop(freqs_cis_key)
+            if torch.is_complex(freqs_cis):
+                freqs_cos = freqs_cis.real
+                freqs_sin = freqs_cis.imag
+            elif freqs_cis.ndim > 0 and freqs_cis.shape[-1] == 2:
+                freqs_cos = freqs_cis[..., 0]
+                freqs_sin = freqs_cis[..., 1]
+            else:
+                # Fallback: interpret tensor as angle and synthesize cos/sin.
+                freqs_cos = freqs_cis.cos()
+                freqs_sin = freqs_cis.sin()
+
+            state_dict[freqs_cos_key] = freqs_cos.float().repeat_interleave(2, dim=-1)
+            state_dict[freqs_sin_key] = freqs_sin.float().repeat_interleave(2, dim=-1)
+
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def forward(self, x: Tensor) -> Tensor:
         s = 1 if self.cls_token else 0  # used to exclude cls_token
@@ -485,23 +541,13 @@ class Attention(nn.Module):
 
         # handle rope and rel pos embeddings
         q, k = self._apply_rope(q, k)
-        if self.use_rel_pos:
-            q, k = concat_rel_pos(
-                q.flatten(0, 1),
-                k.flatten(0, 1),
-                (H, W),
-                x.shape[1:3],
-                self.rel_pos_h,
-                self.rel_pos_w,
-                rescale=True,
-                relative_coords=self.relative_coords,
-            )
 
-            # sdpa expects [B, nheads, H*W, C] so we transpose back
-            q = q.reshape(B, self.num_heads, H * W, -1)
-            k = k.reshape(B, self.num_heads, H * W, -1)
-
-        x = F.scaled_dot_product_attention(q, k, v)
+        if flash_attn_func is not None:
+            x = flash_attn_func(
+                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            ).transpose(1, 2)
+        else:
+            x = F.scaled_dot_product_attention(q, k, v)
 
         if ndim == 4:
             x = (
@@ -795,6 +841,7 @@ class ViT(nn.Module):
         self.ln_post = norm_layer(embed_dim) if ln_post else nn.Identity()
 
         self.apply(self._init_weights)
+        # self.to(dtype=torch.bfloat16)
 
         if compile_mode is not None:
             self.forward = torch.compile(

@@ -35,19 +35,40 @@ recursive_clone = recursive_fn_factory(torch.clone)
 
 
 def compile_wrapper(
-    fn, *, mode="max-autotune", fullgraph=True, dynamic=False, name=None
+    fn,
+    *,
+    mode="max-autotune",
+    fullgraph=True,
+    dynamic=False,
+    name=None,
+    make_contiguous=True,
+    clone_output=True,
 ):
-    compiled_fn = torch.compile(fn, mode=mode, fullgraph=fullgraph, dynamic=dynamic)
+    compiled_fn = torch.compile(
+        fn, mode=mode, fullgraph=fullgraph, dynamic=dynamic
+    )
+    # Avoid runtime `repr(fn)` in every call; module/method repr can be expensive.
+    if name is not None:
+        profile_name = name
+    else:
+        fn_name = getattr(fn, "__qualname__", None) or getattr(fn, "__name__", None)
+        profile_name = f"compiled {fn_name}" if fn_name is not None else "compiled_fn"
+
 
     def compiled_fn_wrapper(*args, **kwargs):
         with torch.autograd.profiler.record_function(
-            f"compiled {fn}" if name is None else name
+            profile_name
         ):
-            cont_args = recursive_contiguous(args)
-            cont_kwargs = recursive_contiguous(kwargs)
+            if make_contiguous:
+                cont_args = recursive_contiguous(args)
+                cont_kwargs = recursive_contiguous(kwargs)
+            else:
+                cont_args = args
+                cont_kwargs = kwargs
             result = compiled_fn(*cont_args, **cont_kwargs)
-            cloned_result = recursive_clone(result)
-            return cloned_result
+            if clone_output:
+                return recursive_clone(result)
+            return result
 
     return compiled_fn_wrapper
 
