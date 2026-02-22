@@ -44,9 +44,7 @@ def compile_wrapper(
     make_contiguous=True,
     clone_output=True,
 ):
-    compiled_fn = torch.compile(
-        fn, mode=mode, fullgraph=fullgraph, dynamic=dynamic
-    )
+    compiled_fn = torch.compile(fn, mode=mode, fullgraph=fullgraph, dynamic=dynamic)
     # Avoid runtime `repr(fn)` in every call; module/method repr can be expensive.
     if name is not None:
         profile_name = name

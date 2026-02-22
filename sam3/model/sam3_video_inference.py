@@ -622,14 +622,14 @@ class Sam3VideoInference(Sam3VideoBase):
             torch.compile(
                 self.detector.segmentation_head.forward,
                 fullgraph=True,
-                mode="max-autotune",
+                mode="max-autotune-no-cudagraphs",
             )
         )
 
         ## Compile Tracker model components
         self.tracker.maskmem_backbone.forward = compile_wrapper(
             self.tracker.maskmem_backbone.forward,
-            mode="max-autotune",
+                mode="max-autotune-no-cudagraphs",
             fullgraph=True,
             dynamic=False,
         )
